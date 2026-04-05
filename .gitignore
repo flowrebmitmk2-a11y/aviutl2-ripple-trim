@@ -1,0 +1,6 @@
+build/
+out/
+dist/
+*.aux2
+*.zip
+.vs/
