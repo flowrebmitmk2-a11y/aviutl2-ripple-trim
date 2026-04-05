@@ -112,14 +112,16 @@ std::vector<OBJECT_HANDLE> collect_selected_objects(EDIT_SECTION* edit) {
 
 std::vector<ObjectInfo> enumerate_objects(EDIT_SECTION* edit,
                                           std::unordered_set<OBJECT_HANDLE> const& selected_set,
-                                          int start_frame) {
+                                          int start_frame,
+                                          int end_frame) {
     std::vector<ObjectInfo> objects;
     int const layer_max = std::max(edit->info->layer_max, 0);
     int const frame_max = std::max(edit->info->frame_max, 0);
     int const first_frame = std::clamp(start_frame, 0, frame_max);
+    int const last_frame = std::clamp(end_frame, first_frame, frame_max);
     for (int layer = 0; layer <= layer_max; ++layer) {
         int frame = first_frame;
-        while (frame <= frame_max) {
+        while (frame <= last_frame) {
             OBJECT_HANDLE object = edit->find_object(layer, frame);
             if (!object) {
                 ++frame;
@@ -129,6 +131,9 @@ std::vector<ObjectInfo> enumerate_objects(EDIT_SECTION* edit,
             if (lf.end < lf.start) {
                 ++frame;
                 continue;
+            }
+            if (lf.start > last_frame) {
+                break;
             }
             objects.push_back(ObjectInfo{
                 object,
@@ -196,6 +201,11 @@ enum class PrepareResult {
     MoveOnly,
     Ready,
     Error,
+};
+
+enum class TrimMode {
+    FullTimeline,
+    SelectedRangeOnly,
 };
 
 PrepareResult prepare_rebuild_op(EDIT_SECTION* edit,
@@ -273,7 +283,7 @@ void sort_move_ops(std::vector<MoveOp>& ops) {
     });
 }
 
-void on_ripple_trim(EDIT_SECTION* edit) {
+void run_ripple_trim(EDIT_SECTION* edit, TrimMode mode) {
     if (!edit || !edit->info) {
         return;
     }
@@ -323,9 +333,30 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         return;
     }
 
+    int enumerate_end = std::max(edit->info->frame_max, cut_end);
+    if (mode == TrimMode::SelectedRangeOnly) {
+        int const range_start = edit->info->select_range_start;
+        int const range_end = edit->info->select_range_end;
+        if (range_start < 0 || range_end < 0 || range_end < range_start) {
+            MessageBoxW(nullptr,
+                        L"フレーム範囲選択を設定してから実行してください。",
+                        L"RippleTrim",
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        if (range_end < cut_start) {
+            MessageBoxW(nullptr,
+                        L"フレーム範囲選択の終了位置が、選択オブジェクトより前にあります。",
+                        L"RippleTrim",
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        enumerate_end = range_end;
+    }
+
     phase_timer = Stopwatch{};
     int const cut_end_exclusive = cut_end + 1;
-    std::vector<ObjectInfo> const objects = enumerate_objects(edit, selected_set, cut_start);
+    std::vector<ObjectInfo> const objects = enumerate_objects(edit, selected_set, cut_start, enumerate_end);
     enumerate_ms = phase_timer.elapsed_ms();
     std::vector<OBJECT_HANDLE> delete_handles = selected;
     std::vector<MoveOp> move_ops;
@@ -343,7 +374,7 @@ void on_ripple_trim(EDIT_SECTION* edit) {
             prepare_rebuild_op(edit, object, cut_start, cut_end_exclusive, rebuild_op, move_op);
         if (result == PrepareResult::Error) {
             plan_ms = phase_timer.elapsed_ms();
-            log_timing(L"prepare-error",
+            log_timing(mode == TrimMode::SelectedRangeOnly ? L"range-only-prepare-error" : L"prepare-error",
                        total_timer.elapsed_ms(),
                        collect_ms,
                        enumerate_ms,
@@ -389,7 +420,7 @@ void on_ripple_trim(EDIT_SECTION* edit) {
     for (MoveOp const& op : move_ops) {
         if (!edit->move_object(op.handle, op.layer, op.new_start)) {
             move_ms = phase_timer.elapsed_ms();
-            log_timing(L"move-error",
+            log_timing(mode == TrimMode::SelectedRangeOnly ? L"range-only-move-error" : L"move-error",
                        total_timer.elapsed_ms(),
                        collect_ms,
                        enumerate_ms,
@@ -417,7 +448,7 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         OBJECT_HANDLE created = edit->create_object_from_alias(op.alias.c_str(), op.layer, op.new_start, 0);
         if (!created) {
             rebuild_ms = phase_timer.elapsed_ms();
-            log_timing(L"rebuild-error",
+            log_timing(mode == TrimMode::SelectedRangeOnly ? L"range-only-rebuild-error" : L"rebuild-error",
                        total_timer.elapsed_ms(),
                        collect_ms,
                        enumerate_ms,
@@ -446,7 +477,7 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         edit->set_focus_object(first_created);
     }
 
-    log_timing(L"success",
+    log_timing(mode == TrimMode::SelectedRangeOnly ? L"range-only-success" : L"success",
                total_timer.elapsed_ms(),
                collect_ms,
                enumerate_ms,
@@ -459,6 +490,14 @@ void on_ripple_trim(EDIT_SECTION* edit) {
                delete_handles.size(),
                move_ops.size(),
                rebuild_ops.size());
+}
+
+void on_ripple_trim(EDIT_SECTION* edit) {
+    run_ripple_trim(edit, TrimMode::FullTimeline);
+}
+
+void on_ripple_trim_selected_range_only(EDIT_SECTION* edit) {
+    run_ripple_trim(edit, TrimMode::SelectedRangeOnly);
 }
 
 }  // namespace
@@ -481,5 +520,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         return;
     }
     host->register_edit_menu(L"タイムライン\\リップル削除(重なり短縮)", on_ripple_trim);
+    host->register_edit_menu(L"タイムライン\\リップル削除(重なり短縮/選択範囲のみ)", on_ripple_trim_selected_range_only);
+    host->register_object_menu(L"リップル削除(重なり短縮/選択範囲のみ)", on_ripple_trim_selected_range_only);
     host->register_object_menu(L"リップル削除(重なり短縮)", on_ripple_trim);
 }
