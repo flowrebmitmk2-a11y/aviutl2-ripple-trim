@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Resolve version
+        shell: powershell
+        run: |
+          $version = '${{ github.ref_name }}'
+          if ($version.StartsWith('v')) {
+            $version = $version.Substring(1)
+          }
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Build package
+        shell: powershell
+        run: ./scripts/build-package.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.RELEASE_VERSION }}
+          body_path: ./release/README.md
+          files: ./release/RippleTrim-v${{ env.RELEASE_VERSION }}.au2pkg.zip
