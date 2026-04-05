@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <aviutl2_sdk/plugin2.h>
+#include <aviutl2_sdk/logger2.h>
 
 namespace {
 
@@ -34,6 +35,59 @@ struct MoveOp {
     int new_start{};
 };
 
+LOG_HANDLE* g_logger = nullptr;
+
+struct Stopwatch {
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER start{};
+
+    Stopwatch() {
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&start);
+    }
+
+    double elapsed_ms() const {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return static_cast<double>(now.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart);
+    }
+};
+
+void log_message(std::wstring const& message) {
+    if (g_logger && g_logger->log) {
+        g_logger->log(g_logger, message.c_str());
+    }
+}
+
+void log_timing(std::wstring const& stage,
+                double total_ms,
+                double collect_ms,
+                double enumerate_ms,
+                double plan_ms,
+                double delete_ms,
+                double move_ms,
+                double rebuild_ms,
+                std::size_t selected_count,
+                std::size_t object_count,
+                std::size_t delete_count,
+                std::size_t move_count,
+                std::size_t rebuild_count) {
+    std::wstring message = L"[timing] stage=" + stage;
+    message += L" total=" + std::to_wstring(total_ms) + L"ms";
+    message += L" collect=" + std::to_wstring(collect_ms) + L"ms";
+    message += L" enumerate=" + std::to_wstring(enumerate_ms) + L"ms";
+    message += L" plan=" + std::to_wstring(plan_ms) + L"ms";
+    message += L" delete=" + std::to_wstring(delete_ms) + L"ms";
+    message += L" move=" + std::to_wstring(move_ms) + L"ms";
+    message += L" rebuild=" + std::to_wstring(rebuild_ms) + L"ms";
+    message += L" selected=" + std::to_wstring(selected_count);
+    message += L" objects=" + std::to_wstring(object_count);
+    message += L" delete_count=" + std::to_wstring(delete_count);
+    message += L" move_count=" + std::to_wstring(move_count);
+    message += L" rebuild_count=" + std::to_wstring(rebuild_count);
+    log_message(message);
+}
+
 COMMON_PLUGIN_TABLE g_common_plugin_table = {
     L"RippleTrim",
     L"TLリップル風に選択区間を削除し、重なったオブジェクトは分割せず短縮する",
@@ -56,12 +110,15 @@ std::vector<OBJECT_HANDLE> collect_selected_objects(EDIT_SECTION* edit) {
     return selected;
 }
 
-std::vector<ObjectInfo> enumerate_objects(EDIT_SECTION* edit, std::unordered_set<OBJECT_HANDLE> const& selected_set) {
+std::vector<ObjectInfo> enumerate_objects(EDIT_SECTION* edit,
+                                          std::unordered_set<OBJECT_HANDLE> const& selected_set,
+                                          int start_frame) {
     std::vector<ObjectInfo> objects;
     int const layer_max = std::max(edit->info->layer_max, 0);
     int const frame_max = std::max(edit->info->frame_max, 0);
+    int const first_frame = std::clamp(start_frame, 0, frame_max);
     for (int layer = 0; layer <= layer_max; ++layer) {
-        int frame = 0;
+        int frame = first_frame;
         while (frame <= frame_max) {
             OBJECT_HANDLE object = edit->find_object(layer, frame);
             if (!object) {
@@ -221,8 +278,31 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         return;
     }
 
+    Stopwatch total_timer{};
+    double collect_ms = 0.0;
+    double enumerate_ms = 0.0;
+    double plan_ms = 0.0;
+    double delete_ms = 0.0;
+    double move_ms = 0.0;
+    double rebuild_ms = 0.0;
+
+    Stopwatch phase_timer{};
     std::vector<OBJECT_HANDLE> const selected = collect_selected_objects(edit);
+    collect_ms = phase_timer.elapsed_ms();
     if (selected.empty()) {
+        log_timing(L"no-selection",
+                   total_timer.elapsed_ms(),
+                   collect_ms,
+                   enumerate_ms,
+                   plan_ms,
+                   delete_ms,
+                   move_ms,
+                   rebuild_ms,
+                   selected.size(),
+                   0,
+                   0,
+                   0,
+                   0);
         MessageBoxW(nullptr,
                     L"選択中のオブジェクトがありません。",
                     L"RippleTrim",
@@ -243,12 +323,15 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         return;
     }
 
-    std::vector<ObjectInfo> const objects = enumerate_objects(edit, selected_set);
+    phase_timer = Stopwatch{};
+    int const cut_end_exclusive = cut_end + 1;
+    std::vector<ObjectInfo> const objects = enumerate_objects(edit, selected_set, cut_start);
+    enumerate_ms = phase_timer.elapsed_ms();
     std::vector<OBJECT_HANDLE> delete_handles = selected;
     std::vector<MoveOp> move_ops;
     std::vector<RebuildOp> rebuild_ops;
-    int const cut_end_exclusive = cut_end + 1;
 
+    phase_timer = Stopwatch{};
     for (ObjectInfo const& object : objects) {
         if (object.selected) {
             continue;
@@ -259,6 +342,20 @@ void on_ripple_trim(EDIT_SECTION* edit) {
         PrepareResult const result =
             prepare_rebuild_op(edit, object, cut_start, cut_end_exclusive, rebuild_op, move_op);
         if (result == PrepareResult::Error) {
+            plan_ms = phase_timer.elapsed_ms();
+            log_timing(L"prepare-error",
+                       total_timer.elapsed_ms(),
+                       collect_ms,
+                       enumerate_ms,
+                       plan_ms,
+                       delete_ms,
+                       move_ms,
+                       rebuild_ms,
+                       selected.size(),
+                       objects.size(),
+                       delete_handles.size(),
+                       move_ops.size(),
+                       rebuild_ops.size());
             return;
         }
         if (result == PrepareResult::Unchanged) {
@@ -279,14 +376,32 @@ void on_ripple_trim(EDIT_SECTION* edit) {
     delete_handles.erase(std::unique(delete_handles.begin(), delete_handles.end()), delete_handles.end());
     sort_move_ops(move_ops);
     sort_rebuild_ops(rebuild_ops);
+    plan_ms = phase_timer.elapsed_ms();
 
+    phase_timer = Stopwatch{};
     for (OBJECT_HANDLE object : delete_handles) {
         edit->delete_object(object);
     }
+    delete_ms = phase_timer.elapsed_ms();
 
     // Free the cut range before moving later objects into it.
+    phase_timer = Stopwatch{};
     for (MoveOp const& op : move_ops) {
         if (!edit->move_object(op.handle, op.layer, op.new_start)) {
+            move_ms = phase_timer.elapsed_ms();
+            log_timing(L"move-error",
+                       total_timer.elapsed_ms(),
+                       collect_ms,
+                       enumerate_ms,
+                       plan_ms,
+                       delete_ms,
+                       move_ms,
+                       rebuild_ms,
+                       selected.size(),
+                       objects.size(),
+                       delete_handles.size(),
+                       move_ops.size(),
+                       rebuild_ops.size());
             MessageBoxW(nullptr,
                         L"オブジェクトの移動に失敗しました。重なりなどで処理を継続できませんでした。",
                         L"RippleTrim",
@@ -294,11 +409,27 @@ void on_ripple_trim(EDIT_SECTION* edit) {
             return;
         }
     }
+    move_ms = phase_timer.elapsed_ms();
 
     OBJECT_HANDLE first_created = nullptr;
+    phase_timer = Stopwatch{};
     for (RebuildOp const& op : rebuild_ops) {
         OBJECT_HANDLE created = edit->create_object_from_alias(op.alias.c_str(), op.layer, op.new_start, 0);
         if (!created) {
+            rebuild_ms = phase_timer.elapsed_ms();
+            log_timing(L"rebuild-error",
+                       total_timer.elapsed_ms(),
+                       collect_ms,
+                       enumerate_ms,
+                       plan_ms,
+                       delete_ms,
+                       move_ms,
+                       rebuild_ms,
+                       selected.size(),
+                       objects.size(),
+                       delete_handles.size(),
+                       move_ops.size(),
+                       rebuild_ops.size());
             MessageBoxW(nullptr,
                         L"オブジェクトの再生成に失敗しました。途中まで反映されている可能性があります。",
                         L"RippleTrim",
@@ -309,10 +440,25 @@ void on_ripple_trim(EDIT_SECTION* edit) {
             first_created = created;
         }
     }
+    rebuild_ms = phase_timer.elapsed_ms();
 
     if (first_created) {
         edit->set_focus_object(first_created);
     }
+
+    log_timing(L"success",
+               total_timer.elapsed_ms(),
+               collect_ms,
+               enumerate_ms,
+               plan_ms,
+               delete_ms,
+               move_ms,
+               rebuild_ms,
+               selected.size(),
+               objects.size(),
+               delete_handles.size(),
+               move_ops.size(),
+               rebuild_ops.size());
 }
 
 }  // namespace
@@ -324,6 +470,10 @@ EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable() {
 EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD version) {
     (void)version;
     return true;
+}
+
+EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* logger) {
+    g_logger = logger;
 }
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
