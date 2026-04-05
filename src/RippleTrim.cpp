@@ -30,6 +30,7 @@ struct RebuildOp {
 struct MoveOp {
     OBJECT_HANDLE handle{};
     int layer{};
+    int old_start{};
     int new_start{};
 };
 
@@ -156,6 +157,7 @@ PrepareResult prepare_rebuild_op(EDIT_SECTION* edit,
     if ((new_end_exclusive - new_start) == (old_end_exclusive - object.start)) {
         move_op.handle = object.handle;
         move_op.layer = object.layer;
+        move_op.old_start = object.start;
         move_op.new_start = new_start;
         return PrepareResult::MoveOnly;
     }
@@ -199,6 +201,18 @@ void sort_rebuild_ops(std::vector<RebuildOp>& ops) {
             return a.new_start < b.new_start;
         }
         return a.new_end < b.new_end;
+    });
+}
+
+void sort_move_ops(std::vector<MoveOp>& ops) {
+    std::sort(ops.begin(), ops.end(), [](MoveOp const& a, MoveOp const& b) {
+        if (a.layer != b.layer) {
+            return a.layer < b.layer;
+        }
+        if (a.new_start != b.new_start) {
+            return a.new_start < b.new_start;
+        }
+        return a.old_start < b.old_start;
     });
 }
 
@@ -263,8 +277,14 @@ void on_ripple_trim(EDIT_SECTION* edit) {
 
     std::sort(delete_handles.begin(), delete_handles.end());
     delete_handles.erase(std::unique(delete_handles.begin(), delete_handles.end()), delete_handles.end());
+    sort_move_ops(move_ops);
     sort_rebuild_ops(rebuild_ops);
 
+    for (OBJECT_HANDLE object : delete_handles) {
+        edit->delete_object(object);
+    }
+
+    // Free the cut range before moving later objects into it.
     for (MoveOp const& op : move_ops) {
         if (!edit->move_object(op.handle, op.layer, op.new_start)) {
             MessageBoxW(nullptr,
@@ -273,10 +293,6 @@ void on_ripple_trim(EDIT_SECTION* edit) {
                         MB_OK | MB_ICONERROR);
             return;
         }
-    }
-
-    for (OBJECT_HANDLE object : delete_handles) {
-        edit->delete_object(object);
     }
 
     OBJECT_HANDLE first_created = nullptr;
